@@ -68,9 +68,147 @@ void RedisServer::printStartMessage(){
 
 /// @brief 开始步骤，打印基本信息，设置对终止信号的处理，即写入文件
 void RedisServer::start(){
-    //如果产生终止信号，就把当前文件内容写入文件中
+    //如果产生终止信号（ctrl+ca），就把当前文件内容写入文件中
     signal(SIGINT, signalHandler);
     printLogo();
     printStartMessage();
 }
 
+/// @brief 处理事务内容
+/// @param commandsQueue 事务中存在的redis语句
+/// @return 返回执行事务内的多条语句组成的结果
+std::string RedisServer::executeTransaction(std::queue<std::string> &commandsQueue){
+    std::vector<std::string> responseMessagesList;
+    while(!commandsQueue.empty()){
+        std::string commandLine = std::move(commandsQueue.front());
+        commandsQueue.pop();
+        std::istringstream iss(commandLine);
+        std::string command;
+        std::vector<std::string> tokens;
+        std::string responseMessage;
+
+        while(iss >> command){
+            tokens.push_back(command);
+        }
+        if(!tokens.empty()){
+            command = tokens.front();
+            std::shared_ptr<CommandParser> commandParser = flyweightFactory->getParser(command); //获取解析器
+            try {
+                responseMessage = commandParser->parse(tokens);
+            } 
+            catch (const std::exception& e) {
+                //语句执行错误，意思是说，hset a 2,本来该条语句应该是这个格式HSET key field value，所以该条语句内容错误
+                responseMessage = "Error processing command '" + command + "': " + e.what();
+            }   
+            responseMessagesList.emplace_back(responseMessage);
+        }
+    }
+    std::string res = "";
+    for(int i=0; i<responseMessagesList.size(); i++){
+        std::string responseMessage = std::to_string(i+1) + ")" + responseMessage[i];
+        res += responseMessage;
+        if(i!=responseMessagesList.size()-1){
+            res+="\n";
+        } 
+    }
+    return res;
+}
+
+/// @brief 处理客户端发过来的信息最原始信息，即字符串形式
+/// @param receiveData 客户端发送过来的字符串
+/// @return 返回客户端的redis语句处理结果
+std::string RedisServer::handleClient(std::string receiveData){
+    size_t bytesRead = receiveData.size();
+    if(bytesRead > 0){
+        std::istringstream iss(receiveData);
+        std::string command;
+        std::vector<std::string> tokens; //redis指令行，按照空格分割
+        while(iss>>command){
+            tokens.push_back(command);
+        }
+        while(!tokens.empty()){
+            command = tokens.front();
+            std::string responseMessage;
+            if(command == "quit" || command == "exit"){
+                responseMessage = "stop";
+                return responseMessage;
+            }
+            else if(command == "multi"){
+                if(startMulti){
+                    responseMessage = "Open the transaction repeatedly";
+                    return responseMessage;
+                }
+                startMulti =true;
+                //queue不支持clear,所以用这个办法，在上一个事务完成（exec或者discard语句后）
+                //本次事务开始时需要清空命令队列
+                std::queue<std::string> empty;
+                std::swap(empty, commandsQueue);
+                responseMessage = "OK";
+                return responseMessage;
+            }
+            else if(command == "exec"){
+                if(startMulti == false){
+                    responseMessage = "No transaction is opened!";
+                    return responseMessage;
+                }
+                startMulti = false;
+                if(!fallback){
+                    responseMessage = executeTransaction(commandsQueue);
+                    return responseMessage;
+                }
+                else{
+                    fallback =false;
+                    responseMessage = "(error) EXECABORT Transaction discarded because of previous errors.";
+                    return responseMessage;
+                }
+            }
+            else if (command == "discard"){
+                startMulti = false;
+                fallback = false;
+                responseMessage = "OK";
+                return responseMessage;
+            }
+            else{
+                if(!startMulti){
+                    std::shared_ptr<CommandParser> commandParser = flyweightFactory->getParser(command);
+                    if (commandParser==nullptr){
+                        responseMessage = "Error: Command '" + command + "' not recognized.";
+                    }
+                    else{
+                        try{
+                            responseMessage = commandParser->parse(tokens);
+                        }
+                        catch(const std::exception &e){
+                            responseMessage = "Error processing command '" + command + "': " + e.what();
+                        }
+                    }
+                    return responseMessage;
+                }
+                else{
+                    std::shared_ptr<CommandParser> commandParser = flyweightFactory->getParser(command);
+                    if (commandParser==nullptr){
+                        fallback = true;
+                        responseMessage = "Error: Command '" + command + "' not recognized.";
+                        return responseMessage;
+                    }
+                    else{
+                        commandsQueue.emplace(receiveData);
+                        responseMessage = "QUEUE";
+                        return responseMessage;
+                    }
+                }
+            }
+        }
+    }
+    else{
+        return "nil";
+    }
+    return "error";
+}
+
+void RedisServer::signalHandler(int sig){
+    if(sig == SIGINT){
+        CommandParser::getRedisHelper()->flush();
+        exit(0);
+    }
+}
